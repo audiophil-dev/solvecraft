@@ -495,6 +495,11 @@ fn circle3(a: V3, b: V3, c: V3) -> Option<(V3, f64, V3)> {
     Some((center, norm(sub(a, center)), unit(n)?))
 }
 
+/// The importer's strict cone band (`step_in/geom.rs`): a cone at or outside either boundary is
+/// rejected, so the writer classifies those profiles as a cylinder or a plane instead.
+const CONE_MIN_ANGLE: f64 = 1e-9;
+const CONE_MAX_ANGLE: f64 = std::f64::consts::FRAC_PI_2 - 1e-9;
+
 /// The analytic surface a surface of revolution is, if its profile is a line or a circular arc
 /// in a plane through the axis.
 fn analytic_revolution(ex: &p21::Exchange, e: &p21::Entity) -> Option<Analytic> {
@@ -548,15 +553,15 @@ fn analytic_revolution(ex: &p21::Exchange, e: &p21::Entity) -> Option<Analytic> 
                 return None;
             }
             let (da, dr) = (dot(d, a), dot(d, eq));
-            if dr.abs() < 1e-12 {
+            let angle = dr.abs().atan2(da.abs());
+            if angle <= CONE_MIN_ANGLE {
                 let r = norm(radial(q));
                 (AnalyticKind::Cylinder { o: oa, z: a, x: eq, r }, eq)
-            } else if da.abs() < 1e-12 {
+            } else if angle >= CONE_MAX_ANGLE {
                 (AnalyticKind::Plane { o: on_axis(q), z: a, x: eq }, a)
             } else {
                 // Open the cone along +z: the radius grows that way.
                 let z = if dr * da > 0.0 { a } else { mul(a, -1.0) };
-                let angle = (dr.abs() / da.abs()).atan();
                 let r = norm(radial(q));
                 let n = sub(mul(eq, angle.cos()), mul(z, angle.sin()));
                 (AnalyticKind::Cone { o: on_axis(q), z, x: eq, r, angle }, n)

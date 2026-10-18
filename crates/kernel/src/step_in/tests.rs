@@ -459,6 +459,28 @@ fn offset_surfaces_nested_and_hostile() {
     assert!(geom::surface(&cx, 5, &points, &[], true, 0).is_err());
 }
 
+/// The writer now keeps away from the importer's cone boundaries; the importer's side of that
+/// contract stays strict, so an equal boundary value is still a malformed cone.
+#[test]
+fn cone_semi_angle_boundaries_are_rejected() {
+    use std::f64::consts::FRAC_PI_2;
+    let points = [mt::Point3::new(0.0, 0.0, 0.0), mt::Point3::new(0.0, 0.0, 1.0)];
+    let surface = |angle: f64| {
+        let text =
+            format!("{HEAD}#1=CARTESIAN_POINT('',(0.,0.,0.));\n#2=AXIS2_PLACEMENT_3D('',#1,$,$);\n#3=CONICAL_SURFACE('',#2,5.,{angle});\n{TAIL}");
+        let ex = p21::parse(&text).unwrap();
+        let cx = Ctx { ex: &ex, len: 1.0, ang: 1.0, tol: 1e-6 };
+        geom::surface(&cx, 3, &points, &[], true, 0)
+    };
+    for angle in [1e-9, FRAC_PI_2 - 1e-9] {
+        let err = surface(angle).unwrap_err();
+        assert!(err.contains("bad cone"), "{angle}: {err}");
+    }
+    for angle in [1.5e-9, FRAC_PI_2 - 1.5e-9] {
+        assert!(surface(angle).is_ok(), "{angle} is inside the importer's band");
+    }
+}
+
 #[test]
 fn offset_surface_cube_import_is_closed_and_editable() {
     // Move each basis plane half a file unit inward; nested quarter-unit offsets
@@ -1482,4 +1504,315 @@ fn periodic_knot_tube_faces_import_and_mesh() {
     let area = 2.0 * std::f64::consts::TAU * r * h;
     assert!(rel(m.area, area) < 0.02, "area {} (expected {area})", m.area);
     assert!(t0.elapsed().as_secs_f64() < 60.0, "took {:?}", t0.elapsed());
+}
+
+// --- native-link angular-classification regressions (task 2) ---------------------------------
+//
+// The writer emits a CONICAL_SURFACE whenever the revolved profile line's unit direction has
+// both a radial and an axial component past `1e-12` (`step_out.rs::analytic_revolution`); the
+// importer accepts only `1e-9 < |half-angle| < pi/2 - 1e-9` (`step_in/geom.rs`). These closed
+// solids pin the two rejected bands (5e-11 rad, pi/2 - 2.5e-12 rad) as round trips that fail
+// before the writer fix and pass after, while the accepted boundary, genuine cones, scaled,
+// reversed and trimmed controls pass throughout.
+
+/// The importer's accepted cone semi-angle band, from `step_in/geom.rs`'s CONICAL_SURFACE arm.
+const CONE_MIN_RAD: f64 = 1e-9;
+const CONE_MAX_RAD: f64 = std::f64::consts::FRAC_PI_2 - 1e-9;
+
+/// Analytic area/volume tolerance for the kernel's chord tessellation. `measure` integrates a
+/// chord mesh split no finer than `size * 1e-6` (`Body::tessellate_within`); the measured errors
+/// here are a few times `1e-5`, and the project's own oracle default is `1e-3`.
+const TESSELLATED_REL: f64 = 1e-4;
+
+/// A closed solid of revolution: the closed `profile` in the XZ sketch plane turned `angle`
+/// about the sketch Y axis (local X is the radius, local Y the axis).
+fn native_link_angular_revolve(profile: &[Vec2], angle: f64) -> Body {
+    let pl = Plane { origin: Vec3::ZERO, ..Plane::XZ };
+    let region = Region2 { outer: Loop2::polygon(profile), holes: vec![] };
+    revolve(&pl, &[region], Vec2::ZERO, Vec2::Y, angle).unwrap().remove(0)
+}
+
+/// A frustum: bottom radius `r0`, top radius `r1`, height `h`, flat caps on the axis.
+fn native_link_angular_frustum(r0: f64, r1: f64, h: f64) -> Body {
+    native_link_angular_revolve(&[Vec2::new(0.0, 0.0), Vec2::new(r0, 0.0), Vec2::new(r1, h), Vec2::new(0.0, h)], std::f64::consts::TAU)
+}
+
+/// A closed washer (annular pipe): inner radius `ri`, outer radius `ro`, height `h`. `taper`
+/// moves the outer top corner radially (a cone on the outer wall), `tilt` moves the inner top
+/// corner axially (a cone on the top cap).
+fn native_link_angular_washer(ri: f64, ro: f64, h: f64, taper: f64, tilt: f64) -> Body {
+    native_link_angular_revolve(&[Vec2::new(ri, 0.0), Vec2::new(ro, 0.0), Vec2::new(ro + taper, h), Vec2::new(ri, h + tilt)], std::f64::consts::TAU)
+}
+
+/// Analytic volume of the washer as a hollow cylinder pi*h*(ro^2 - ri^2); `taper`/`tilt` are far
+/// below the tessellation floor.
+fn washer_volume(ri: f64, ro: f64, h: f64) -> f64 {
+    std::f64::consts::PI * h * (ro * ro - ri * ri)
+}
+
+/// The factor converting the file's plane-angle unit to radians (our writer always prints
+/// radians; a degree file is converted rather than assumed away).
+fn step_plane_angle_factor(text: &str) -> f64 {
+    let unit = text.lines().find(|l| l.contains("PLANE_ANGLE_UNIT")).unwrap_or_else(|| panic!("no plane angle unit in the file"));
+    if unit.contains(".RADIAN.") {
+        1.0
+    } else if unit.contains(".DEGREE.") {
+        std::f64::consts::PI / 180.0
+    } else {
+        panic!("unsupported plane angle unit: {unit}")
+    }
+}
+
+/// Every CONICAL_SURFACE in an exported file: entity id, serialized semi-angle text and the
+/// angle in radians after the file's own angle-unit conversion.
+fn emitted_cone_semi_angles(text: &str, angle_factor: f64) -> Vec<(u64, String, f64)> {
+    let mut out = Vec::new();
+    for line in text.lines().map(str::trim) {
+        let Some((id, body)) = line.strip_prefix('#').and_then(|r| r.split_once('=')) else { continue };
+        let Some(args) = body.strip_prefix("CONICAL_SURFACE(") else { continue };
+        let Some(raw) = args.strip_suffix(");").and_then(|a| a.rsplit(',').next()) else { continue };
+        let id: u64 = id.parse().unwrap_or_else(|e| panic!("entity id {id:?}: {e}"));
+        let semi: f64 = raw.parse().unwrap_or_else(|e| panic!("semi-angle {raw:?}: {e}"));
+        out.push((id, raw.to_string(), semi * angle_factor));
+    }
+    out
+}
+
+/// Export, classify the emitted cones and import: the shared body of the regression cases.
+fn native_link_angular_round_trip(b: &Body) -> (String, Vec<(u64, String, f64)>, StepImport) {
+    let text = step_export(&[b], "test").unwrap();
+    step_validate(&text).unwrap();
+    let cones = emitted_cone_semi_angles(&text, step_plane_angle_factor(&text));
+    let imp = step_import(&text).unwrap();
+    (text, cones, imp)
+}
+
+/// The face ids the importer rejected, from its `face #N:` warnings.
+fn rejected_face_ids(warnings: &[String]) -> Vec<u64> {
+    let mut out = Vec::new();
+    for w in warnings {
+        let Some(rest) = w.split("face #").nth(1) else { continue };
+        if let Ok(id) = rest.split(':').next().unwrap_or("").parse::<u64>() {
+            out.push(id);
+        }
+    }
+    out
+}
+
+/// The near-axis failing band: half-angle 5e-11 rad. The writer still calls the wall a cone
+/// (its radial component 5e-11 > 1e-12); the importer rejects anything at or below 1e-9.
+#[test]
+fn native_link_angular_rejected_near_axis_round_trips_closed() {
+    let h = 5.0;
+    let b = native_link_angular_washer(8.0, 10.0, h, h * 5e-11, 0.0);
+    assert!(b.validity().is_empty(), "fixture is not a closed solid: {:?}", b.validity());
+    assert!(rel(measure(&b).unwrap().volume, washer_volume(8.0, 10.0, h)) < 1e-3, "fixture volume is not the analytic washer");
+    let (_, cones, imp) = native_link_angular_round_trip(&b);
+    assert!(imp.bodies[0].closed && imp.warnings.is_empty(), "writer emitted {cones:?}; importer reported {:?}", imp.warnings);
+    for (id, raw, a) in &cones {
+        assert!(
+            a.abs() > CONE_MIN_RAD && a.abs() < CONE_MAX_RAD,
+            "writer emitted CONICAL_SURFACE #{id} semi-angle {raw} = {a} rad, in the importer's rejected band"
+        );
+    }
+    assert!(imp.bodies[0].body.validity().is_empty(), "{:?}", imp.bodies[0].body.validity());
+}
+
+/// The near-plane failing band: half-angle pi/2 - 2.5e-12 rad, a nearly flat top cap the writer
+/// still calls a cone.
+#[test]
+fn native_link_angular_rejected_near_plane_round_trips_closed() {
+    let (ri, ro, h) = (8.0, 10.0, 5.0);
+    let b = native_link_angular_washer(ri, ro, h, 0.0, (ro - ri) * 2.5e-12);
+    assert!(b.validity().is_empty(), "fixture is not a closed solid: {:?}", b.validity());
+    assert!(rel(measure(&b).unwrap().volume, washer_volume(ri, ro, h)) < 1e-3, "fixture volume is not the analytic washer");
+    let (_, cones, imp) = native_link_angular_round_trip(&b);
+    assert!(imp.bodies[0].closed && imp.warnings.is_empty(), "writer emitted {cones:?}; importer reported {:?}", imp.warnings);
+    for (id, raw, a) in &cones {
+        assert!(
+            a.abs() > CONE_MIN_RAD && a.abs() < CONE_MAX_RAD,
+            "writer emitted CONICAL_SURFACE #{id} semi-angle {raw} = {a} rad, in the importer's rejected band"
+        );
+    }
+    assert!(imp.bodies[0].body.validity().is_empty(), "{:?}", imp.bodies[0].body.validity());
+}
+
+/// The accepted-band boundary on each side (1.5e-9 rad, pi/2 - 1.5e-9 rad): a cone the importer
+/// accepts both before and after the fix, so no over-correction turns it into a plane/cylinder.
+#[test]
+fn native_link_angular_accepted_controls_round_trip() {
+    let h = 5.0;
+    let near_axis = native_link_angular_washer(8.0, 10.0, h, h * 1.5e-9, 0.0);
+    let near_plane = native_link_angular_washer(8.0, 10.0, h, 0.0, 2.0 * 1.5e-9);
+    for (name, b) in [("near_axis", &near_axis), ("near_plane", &near_plane)] {
+        assert!(b.validity().is_empty(), "{name}: fixture is not closed: {:?}", b.validity());
+        assert!(rel(measure(b).unwrap().volume, washer_volume(8.0, 10.0, 5.0)) < 1e-3, "{name}: fixture volume is not the analytic washer");
+        let (_, cones, imp) = native_link_angular_round_trip(b);
+        assert!(!cones.is_empty(), "{name}: the accepted half-angle must still be a cone");
+        for (id, raw, a) in &cones {
+            assert!(
+                a.abs() > CONE_MIN_RAD && a.abs() < CONE_MAX_RAD,
+                "{name}: CONICAL_SURFACE #{id} semi-angle {raw} = {a} rad is outside the importer's accepted band"
+            );
+        }
+        assert!(imp.bodies[0].closed, "{name}: importer rejected the accepted-band cone: {:?}", imp.warnings);
+        println!("native_link_angular_accepted_{name}: warnings {:?} validity {:?}", imp.warnings, imp.bodies[0].body.validity());
+        // The near-plane control keeps its angle inside the band (what this control proves).
+        // Its near-degenerate face still does not mesh in the importer, a separate limitation
+        // recorded in the task notepad, so only the near-axis control is measured end to end.
+        if name == "near_axis" {
+            let (m0, m1) = (measure(b).unwrap(), measure(&imp.bodies[0].body).unwrap());
+            assert!(m1.volume.is_finite() && m1.volume > 0.0, "{name}: volume {}", m1.volume);
+            assert!(rel(m1.volume, m0.volume) < 1e-3, "{name}: round-trip volume {} vs {}", m1.volume, m0.volume);
+        }
+    }
+}
+
+/// Genuine cones at 0.3 and 1.0 rad: one CONICAL_SURFACE, closed round trip, analytic volume
+/// and area. The volume error is bounded by the kernel's tessellation floor, not by 1e-6.
+#[test]
+fn native_link_angular_genuine_cones_round_trip() {
+    use std::f64::consts::PI;
+    let h = 5.0;
+    for (name, half) in [("0.3", 0.3f64), ("1.0", 1.0f64)] {
+        let (r0, r1) = (8.0, 8.0 + h * half.tan());
+        let b = native_link_angular_frustum(r0, r1, h);
+        assert!(b.validity().is_empty(), "{name}: fixture is not closed: {:?}", b.validity());
+        // Frustum volume pi*h*(r0^2 + r0*r1 + r1^2)/3, lateral pi*(r0+r1)*hypot(h, r1-r0) plus caps.
+        let want_v = PI * h * (r0 * r0 + r0 * r1 + r1 * r1) / 3.0;
+        let want_a = PI * (r0 + r1) * (h * h + (r1 - r0) * (r1 - r0)).sqrt() + PI * (r0 * r0 + r1 * r1);
+        let got_v = b.volume_at(b.size() * 1e-6).unwrap();
+        let got_a = measure(&b).unwrap().area;
+        println!(
+            "native_link_angular_genuine_{name}: volume {got_v} want {want_v} (rel {:.3e}); area {got_a} want {want_a} (rel {:.3e})",
+            rel(got_v, want_v),
+            rel(got_a, want_a)
+        );
+        assert!(rel(got_v, want_v) < 1e-5, "{name}: volume {got_v} vs analytic {want_v}");
+        assert!(rel(got_a, want_a) < TESSELLATED_REL, "{name}: area {got_a} vs analytic {want_a}");
+        let (_, cones, imp) = native_link_angular_round_trip(&b);
+        assert_eq!(cones.len(), 1, "{name}: a genuine cone is one CONICAL_SURFACE, got {cones:?}");
+        for (id, raw, a) in &cones {
+            assert!((a - half).abs() < 1e-9, "{name}: CONICAL_SURFACE #{id} semi-angle {raw} is not {half}");
+        }
+        assert!(imp.bodies[0].closed && imp.warnings.is_empty(), "{name}: importer reported {:?}", imp.warnings);
+        let v1 = measure(&imp.bodies[0].body).unwrap().volume;
+        assert!(rel(v1, measure(&b).unwrap().volume) < TESSELLATED_REL, "{name}: round-trip volume {v1}");
+    }
+}
+
+/// Sub-millimetre and metre-scale genuine cones round-trip closed with positive finite measures.
+#[test]
+fn native_link_angular_scaled_controls_round_trip() {
+    for (name, scale) in [("sub_mm", 0.01f64), ("metre", 100.0f64)] {
+        let (h, r0) = (5.0 * scale, 8.0 * scale);
+        let b = native_link_angular_frustum(r0, r0 + h * 0.3f64.tan(), h);
+        assert!(b.validity().is_empty(), "{name}: fixture is not closed: {:?}", b.validity());
+        let (_, _, imp) = native_link_angular_round_trip(&b);
+        assert!(imp.bodies[0].closed && imp.warnings.is_empty(), "{name}: importer reported {:?}", imp.warnings);
+        assert!(imp.bodies[0].body.validity().is_empty(), "{name}: {:?}", imp.bodies[0].body.validity());
+        let (m0, m1) = (measure(&b).unwrap(), measure(&imp.bodies[0].body).unwrap());
+        assert!(m1.volume.is_finite() && m1.volume > 0.0, "{name}: volume {}", m1.volume);
+        assert!(rel(m1.volume, m0.volume) < 1e-3, "{name}: round-trip volume {} vs {}", m1.volume, m0.volume);
+    }
+}
+
+/// A mirrored (orientation-reversed) genuine cone keeps its sense through the writer.
+#[test]
+fn native_link_angular_reversed_orientation_round_trip() {
+    let h = 5.0;
+    let b = native_link_angular_frustum(8.0, 8.0 + h * 0.3f64.tan(), h);
+    let m = crate::transform_matrix(&b, [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0], [0.0, 0.0, 16.0, 1.0]]).unwrap();
+    assert!(m.validity().is_empty(), "mirrored fixture is not closed: {:?}", m.validity());
+    let text = step_export(&[&m], "test").unwrap();
+    step_validate(&text).unwrap();
+    assert_eq!(crate::step_orientation_errors(&text).unwrap(), Vec::<String>::new());
+    let imp = step_import(&text).unwrap();
+    assert!(imp.bodies[0].closed && imp.warnings.is_empty(), "importer reported {:?}", imp.warnings);
+    assert!(imp.bodies[0].body.validity().is_empty(), "{:?}", imp.bodies[0].body.validity());
+}
+
+/// A genuine cone frustum swept a partial turn: the cone face is trimmed by the two flat ends.
+#[test]
+fn native_link_angular_bounded_trimmed_round_trip() {
+    let (h, r0) = (5.0, 8.0);
+    let b = native_link_angular_revolve(
+        &[Vec2::new(0.0, 0.0), Vec2::new(r0, 0.0), Vec2::new(r0 + h * 0.3f64.tan(), h), Vec2::new(0.0, h)],
+        1.5 * std::f64::consts::PI,
+    );
+    assert!(b.validity().is_empty(), "fixture is not closed: {:?}", b.validity());
+    let (_, cones, imp) = native_link_angular_round_trip(&b);
+    assert!(!cones.is_empty(), "trimmed cone face should still be a CONICAL_SURFACE: {cones:?}");
+    assert!(imp.bodies[0].closed && imp.warnings.is_empty(), "importer reported {:?}", imp.warnings);
+    assert!(imp.bodies[0].body.validity().is_empty(), "{:?}", imp.bodies[0].body.validity());
+}
+
+/// Records the emitted Part 21 cone classification for every case into
+/// `SOLIDCRAFT_NATIVE_LINK_ARTIFACT_DIR/task-2-surface-classification.json` when that variable is
+/// set, and writes the failing-band diagnostic STEP files beside it. Accepted controls must stay
+/// strictly inside the importer's band after serialization.
+#[test]
+fn native_link_angular_surface_classification() {
+    let h = 5.0;
+    let cases: Vec<(&str, Body, bool)> = vec![
+        ("near_axis_5e-11", native_link_angular_washer(8.0, 10.0, h, h * 5e-11, 0.0), false),
+        ("near_plane_pi_over_2_minus_2.5e-12", native_link_angular_washer(8.0, 10.0, h, 0.0, 2.0 * 2.5e-12), false),
+        ("accepted_1.5e-9", native_link_angular_washer(8.0, 10.0, h, h * 1.5e-9, 0.0), true),
+        ("accepted_pi_over_2_minus_1.5e-9", native_link_angular_washer(8.0, 10.0, h, 0.0, 2.0 * 1.5e-9), true),
+        ("genuine_0.3", native_link_angular_frustum(8.0, 8.0 + h * 0.3f64.tan(), h), true),
+        ("genuine_1.0", native_link_angular_frustum(8.0, 8.0 + h * 1.0f64.tan(), h), true),
+    ];
+    let artifact_dir = solidcraft_geom::env::var("NATIVE_LINK_ARTIFACT_DIR");
+    let mut json = String::from("{\n  \"task\": \"2\",\n  \"importer_band_rad\": [1e-9, 1.5707963257948968],\n  \"cases\": [\n");
+    for (i, (name, b, accepted)) in cases.iter().enumerate() {
+        let text = step_export(&[b], name).unwrap();
+        let cones = emitted_cone_semi_angles(&text, step_plane_angle_factor(&text));
+        let imp = step_import(&text).unwrap();
+        if *accepted {
+            for (id, raw, a) in &cones {
+                assert!(
+                    a.abs() > CONE_MIN_RAD && a.abs() < CONE_MAX_RAD,
+                    "{name}: accepted control emitted CONICAL_SURFACE #{id} semi-angle {raw} outside the importer band"
+                );
+            }
+        }
+        json.push_str(&format!(
+            "    {{\"name\": \"{name}\", \"native_faces\": {}, \"emitted_surface_counts\": {{\"CONICAL_SURFACE\": {}, \"CYLINDRICAL_SURFACE\": {}, \"PLANE\": {}, \"B_SPLINE_SURFACE\": {}}}, \"import_closed\": {}, \"emitted_cones\": [",
+            b.face_count(),
+            text.matches("CONICAL_SURFACE(").count(),
+            text.matches("CYLINDRICAL_SURFACE(").count(),
+            text.matches("PLANE('").count(),
+            text.matches("B_SPLINE_SURFACE(").count() + text.matches("B_SPLINE_SURFACE_WITH_KNOTS(").count(),
+            imp.bodies[0].closed
+        ));
+        for (j, (id, raw, a)) in cones.iter().enumerate() {
+            if j > 0 {
+                json.push_str(", ");
+            }
+            json.push_str(&format!(
+                "{{\"entity\": {id}, \"serialized\": \"{raw}\", \"radians\": {a}, \"in_importer_band\": {}}}",
+                a.abs() > CONE_MIN_RAD && a.abs() < CONE_MAX_RAD
+            ));
+        }
+        json.push_str("], \"rejected_face_ids\": [");
+        for (j, id) in rejected_face_ids(&imp.warnings).iter().enumerate() {
+            if j > 0 {
+                json.push_str(", ");
+            }
+            json.push_str(&id.to_string());
+        }
+        json.push_str(&format!("], \"import_warnings\": \"{}\"}}", imp.warnings.join("; ").replace('"', "'")));
+        if i + 1 < cases.len() {
+            json.push(',');
+        }
+        json.push('\n');
+        if !*accepted && let Some(dir) = &artifact_dir {
+            std::fs::write(format!("{dir}/step/{name}.step"), &text).unwrap();
+        }
+    }
+    json.push_str("  ]\n}\n");
+    if let Some(dir) = &artifact_dir {
+        std::fs::write(format!("{dir}/task-2-surface-classification.json"), &json).unwrap();
+    }
+    println!("{json}");
 }
