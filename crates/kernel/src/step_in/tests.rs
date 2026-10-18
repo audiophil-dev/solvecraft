@@ -1544,6 +1544,17 @@ fn native_link_angular_washer(ri: f64, ro: f64, h: f64, taper: f64, tilt: f64) -
     native_link_angular_revolve(&[Vec2::new(ri, 0.0), Vec2::new(ro, 0.0), Vec2::new(ro + taper, h), Vec2::new(ri, h + tilt)], std::f64::consts::TAU)
 }
 
+/// The washer over three quarters of a turn. v0.15.0 heals a full revolution
+/// (`build::turned_whole`), and a face within `size * 1e-7` of a plane becomes that plane, which
+/// rewrites a near-plane cone before the writer classifies it. A partial turn skips the heal, so
+/// the near-plane band still reaches `analytic_revolution`.
+fn native_link_angular_partial_washer(ri: f64, ro: f64, h: f64, taper: f64, tilt: f64) -> Body {
+    native_link_angular_revolve(
+        &[Vec2::new(ri, 0.0), Vec2::new(ro, 0.0), Vec2::new(ro + taper, h), Vec2::new(ri, h + tilt)],
+        0.75 * std::f64::consts::TAU,
+    )
+}
+
 /// Analytic volume of the washer as a hollow cylinder pi*h*(ro^2 - ri^2); `taper`/`tilt` are far
 /// below the tessellation floor.
 fn washer_volume(ri: f64, ro: f64, h: f64) -> f64 {
@@ -1623,9 +1634,9 @@ fn native_link_angular_rejected_near_axis_round_trips_closed() {
 #[test]
 fn native_link_angular_rejected_near_plane_round_trips_closed() {
     let (ri, ro, h) = (8.0, 10.0, 5.0);
-    let b = native_link_angular_washer(ri, ro, h, 0.0, (ro - ri) * 2.5e-12);
+    let b = native_link_angular_partial_washer(ri, ro, h, 0.0, (ro - ri) * 2.5e-12);
     assert!(b.validity().is_empty(), "fixture is not a closed solid: {:?}", b.validity());
-    assert!(rel(measure(&b).unwrap().volume, washer_volume(ri, ro, h)) < 1e-3, "fixture volume is not the analytic washer");
+    assert!(rel(measure(&b).unwrap().volume, washer_volume(ri, ro, h) * 0.75) < 1e-3, "fixture volume is not the analytic washer");
     let (_, cones, imp) = native_link_angular_round_trip(&b);
     assert!(imp.bodies[0].closed && imp.warnings.is_empty(), "writer emitted {cones:?}; importer reported {:?}", imp.warnings);
     for (id, raw, a) in &cones {
@@ -1643,10 +1654,10 @@ fn native_link_angular_rejected_near_plane_round_trips_closed() {
 fn native_link_angular_accepted_controls_round_trip() {
     let h = 5.0;
     let near_axis = native_link_angular_washer(8.0, 10.0, h, h * 1.5e-9, 0.0);
-    let near_plane = native_link_angular_washer(8.0, 10.0, h, 0.0, 2.0 * 1.5e-9);
-    for (name, b) in [("near_axis", &near_axis), ("near_plane", &near_plane)] {
+    let near_plane = native_link_angular_partial_washer(8.0, 10.0, h, 0.0, 2.0 * 1.5e-9);
+    for (name, b, turn) in [("near_axis", &near_axis, 1.0), ("near_plane", &near_plane, 0.75)] {
         assert!(b.validity().is_empty(), "{name}: fixture is not closed: {:?}", b.validity());
-        assert!(rel(measure(b).unwrap().volume, washer_volume(8.0, 10.0, 5.0)) < 1e-3, "{name}: fixture volume is not the analytic washer");
+        assert!(rel(measure(b).unwrap().volume, washer_volume(8.0, 10.0, 5.0) * turn) < 1e-3, "{name}: fixture volume is not the analytic washer");
         let (_, cones, imp) = native_link_angular_round_trip(b);
         assert!(!cones.is_empty(), "{name}: the accepted half-angle must still be a cone");
         for (id, raw, a) in &cones {
@@ -1756,9 +1767,9 @@ fn native_link_angular_surface_classification() {
     let h = 5.0;
     let cases: Vec<(&str, Body, bool)> = vec![
         ("near_axis_5e-11", native_link_angular_washer(8.0, 10.0, h, h * 5e-11, 0.0), false),
-        ("near_plane_pi_over_2_minus_2.5e-12", native_link_angular_washer(8.0, 10.0, h, 0.0, 2.0 * 2.5e-12), false),
+        ("near_plane_pi_over_2_minus_2.5e-12", native_link_angular_partial_washer(8.0, 10.0, h, 0.0, 2.0 * 2.5e-12), false),
         ("accepted_1.5e-9", native_link_angular_washer(8.0, 10.0, h, h * 1.5e-9, 0.0), true),
-        ("accepted_pi_over_2_minus_1.5e-9", native_link_angular_washer(8.0, 10.0, h, 0.0, 2.0 * 1.5e-9), true),
+        ("accepted_pi_over_2_minus_1.5e-9", native_link_angular_partial_washer(8.0, 10.0, h, 0.0, 2.0 * 1.5e-9), true),
         ("genuine_0.3", native_link_angular_frustum(8.0, 8.0 + h * 0.3f64.tan(), h), true),
         ("genuine_1.0", native_link_angular_frustum(8.0, 8.0 + h * 1.0f64.tan(), h), true),
     ];
