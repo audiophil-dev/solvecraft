@@ -1,0 +1,7 @@
+# Constraints
+
+- Keep the upgrade based on the validated stable tag, not moving upstream main. Further integration needs renewed validation. v0.15.0 reads/writes format 26; format 27 was observed on main during the October 2026 audit, not on the tag. Never bypass format guards or downgrade designs.
+- Preserve the writer-side half-angle classification repair and importer validation. Production commit `b1032e80` carries the original repair; `b36998c2` makes near-plane test fixtures partial revolutions because upstream heals the full-turn fixtures before the writer runs.
+- Application installation, MCP default changes, upstream PRs and releases require separate authorization. A CLI override can still bridge to an existing desktop app; use an unused control port for a headless trial. State remains in the installed release state directory. Trial only on disposable copies preserving relative source links.
+- Keep private CAD copies, raw evidence, session state, logs and build artifacts out of Git. Local `/.omo/`, `/logs/` and `/.cortexkit/` exclusions preserve those files without publishing them.
+- Serialize heavy builds, use the repository `ci` profile and precise test targets, measure disk headroom and stop before exhaustion. The full ci-profile build exceeded the earlier 12-15 GiB estimate. Do not treat an estimated footprint as an admission guarantee; preserve release binaries and evidence during cleanup.
