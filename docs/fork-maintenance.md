@@ -10,7 +10,7 @@ trial the candidate binary without changing the installed application.
 | Ref | Commit | Contents |
 |---|---|---|
 | `v0.15.0` (tag) | `fa691707c224cae580c42201ed3a22d5e4b8c716` | Upstream 0.15.0 release; the fork base |
-| `upgrade/v0.15.0-cone-repair` | `b36998c2` | Base plus the two commits below |
+| `upgrade/v0.15.0-cone-repair` | current HEAD | Validated code revision `b36998c2` plus documentation and memory commits |
 | `fix/step-out-cone-classification-band` | `d1fe720c` | Original repair branch, kept unchanged |
 
 On `upgrade/v0.15.0-cone-repair`, in order:
@@ -19,6 +19,10 @@ On `upgrade/v0.15.0-cone-repair`, in order:
   a cherry-pick of `d1fe720c`.
 - `b36998c2` `test(kernel): re-anchor the near-plane cone regressions to a partial turn`: the only
   deliberate deviation from the original repair.
+
+`b36998c2` is the validated code revision, not the branch HEAD. Later commits on the branch are
+documentation and memory only; compare them with
+`git log --oneline b36998c2..fork/upgrade/v0.15.0-cone-repair`.
 
 Both branches are pushed to the fork remote; `git remote -v` shows the remote names and URLs.
 The base is tag-pinned on purpose. Do not merge the current upstream `main` into this branch:
@@ -45,8 +49,8 @@ base.
 ## Validation state
 
 This is not a green-CI claim. The quick gates and the reference suite pass; the full suites exit
-non-zero with every failure classified as upstream, environment or contention, and none reaches
-the repair surface.
+non-zero with every failure classified as upstream, environment or contention, and none is
+classified as repair-caused.
 
 - Quick gates passed in the full run: `fmt`, assets, icons, licences, sorted lists and layer
   checks, and `clippy -D warnings`.
@@ -108,8 +112,9 @@ SOLIDCRAFT_CONTROL_PORT=17878 \
 opencode
 ```
 
-The path above is checkout-specific and is shown as an example. `17878` is the port used for
-the trial; choose another unused port if it is taken.
+The path above is checkout-specific and is shown as an example. `17878` is an example port for a
+future trial; use an unused port. These are instructions, not a record that the candidate MCP
+trial has run.
 
 - Use a non-default port for a headless trial. The launcher probes the configured port and
   bridges to an app that answers with the shared control token, so the default `7878` can
@@ -132,10 +137,18 @@ git log --oneline v0.15.0..fork/upgrade/v0.15.0-cone-repair
 git ls-remote --heads fork
 ```
 
-Expected tag: `fa691707c224cae580c42201ed3a22d5e4b8c716`. Expected branch tip:
-`b36998c2` on `upgrade/v0.15.0-cone-repair` and `d1fe720c` on
-`fix/step-out-cone-classification-band`. Refetch upstream before any future integration work;
-the upstream tip is not the fork base.
+Expected tag: `fa691707c224cae580c42201ed3a22d5e4b8c716`. Expected validated code revision:
+`b36998c2` for `upgrade/v0.15.0-cone-repair`; its current HEAD is later and contains only
+documentation and memory commits. `d1fe720c` remains the tip of
+`fix/step-out-cone-classification-band`. Compare HEAD with the fork branch:
+
+```sh
+git rev-parse HEAD
+git rev-parse fork/upgrade/v0.15.0-cone-repair
+git rev-list --left-right --count HEAD...fork/upgrade/v0.15.0-cone-repair
+```
+
+Refetch upstream before any future integration work; the upstream tip is not the fork base.
 
 ## Known limitations
 
@@ -143,5 +156,5 @@ the upstream tip is not the fork base.
   STEP writer and fails with a headless widget-lookup symptom. An empirical `ui-egui` baseline
   was deferred for disk reasons, so the classification is not empirical.
 - The build-log and embedded-SHA gaps above remain.
-- The repair and the launcher trial are documented here; upstreaming the two commits remains
-  open.
+- The repair and the launcher trial instructions are documented here; upstreaming the two
+  commits remains open.
