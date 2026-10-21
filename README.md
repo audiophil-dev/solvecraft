@@ -89,6 +89,8 @@ Install details, upgrading from earlier builds and building from source are in
 
 **Documentation:** the [SolidCraft book](https://docs.solidcraft.io/) (user guide,
 developer guide and command reference; sources in [docs/book](docs/book)).
+This fork's branches, validation results and limits are in
+[fork maintenance](docs/fork-maintenance.md).
 
 **Community:** chat with users and contributors on [Discord](https://solidcraft.io/discord).
 
